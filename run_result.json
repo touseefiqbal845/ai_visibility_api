@@ -1,0 +1,25 @@
+﻿{
+    "completed_at":  "2026-08-10T07:20:09.243538Z",
+    "error_message":  "query discovery failed: query_discovery: Anthropic request failed: Error code: 401 - {\u0027type\u0027: \u0027error\u0027, \u0027error\u0027: {\u0027type\u0027: \u0027authentication_error\u0027, \u0027message\u0027: \u0027invalid x-api-key\u0027}, \u0027request_id\u0027: \u0027req_011CdtfPFDg4zXbMhtGRFrNQ\u0027}",
+    "profile_uuid":  "041a01ed-a527-421a-967c-a87b048b9ada",
+    "queries_discovered":  0,
+    "queries_scored":  0,
+    "recommendations":  [
+
+                        ],
+    "recommendations_generated":  0,
+    "run_uuid":  "16cde8c2-706f-46a5-8d8c-24735936cb12",
+    "started_at":  "2026-08-10T07:20:08.161458Z",
+    "status":  "failed",
+    "tokens_used":  {
+                        "input":  0,
+                        "output":  0,
+                        "total":  0
+                    },
+    "top_opportunities":  [
+
+                          ],
+    "warnings":  [
+
+                 ]
+}
