@@ -219,5 +219,4 @@ on the JSON-recovery edge cases, plus review passes over the orchestrator's fail
 handling. The architecture, the failure policy, the scoring formula and its weights,
 and the schema are my decisions; I've documented the reasoning for each above and can
 walk through any of them.
-#   a i _ v i s i b i l i t y _ a p i  
- 
+#
