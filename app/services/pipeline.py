@@ -31,6 +31,16 @@ from app.agents import (
 )
 from app.clients.dataforseo import DataForSEOClient, DataForSEOError, KeywordMetrics
 from app.clients.llm import AnthropicClient, LLMError
+from app.constants import (
+    LLM_STATUS_ERROR,
+    RUN_KIND_RECHECK,
+    STAGE_DISCOVERY,
+    STAGE_METRICS,
+    STAGE_RECOMMENDATION,
+    STAGE_SCORING,
+    STAGE_SEQUENCE,
+    STAGE_UPSTREAM,
+)
 from app.extensions import db
 from app.models import (
     PROFILE_STATUS_FAILED,
@@ -44,10 +54,22 @@ from app.models import (
     BusinessProfile,
     ContentRecommendation,
     DiscoveredQuery,
+    LlmCallLog,
     PipelineRun,
+    PipelineStageStat,
 )
 from app.models.base import utcnow
 from app.utils.logging import set_correlation_id
+from app.utils.run_audit import (
+    AuditBuffer,
+    StageRecord,
+    clear_audit,
+    current_audit,
+    estimate_llm_cost,
+    reset_audit_query,
+    set_audit_query,
+    start_audit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,29 +154,33 @@ class PipelineOrchestrator:
 
         set_correlation_id(run.uuid)
         state = _RunState()
+        audit = start_audit()
         logger.info("pipeline started", extra={"profile_uuid": profile.uuid})
 
         try:
-            queries = self._discover(profile, run, state)
-            self._score_all(profile, run, queries, state)
-            self._recommend(profile, run, state)
-        except PipelineError as exc:
-            self._finalise_failure(profile, run, state, str(exc))
-            return run
-        except Exception as exc:  # noqa: BLE001 - the run record must reflect any failure
-            logger.exception("pipeline crashed", extra={"profile_uuid": profile.uuid})
-            self._finalise_failure(profile, run, state, f"unexpected error: {exc}")
-            return run
+            try:
+                queries = self._discover(profile, run, state)
+                self._score_all(profile, run, queries, state)
+                self._recommend(profile, run, state)
+            except PipelineError as exc:
+                self._finalise_failure(profile, run, state, audit, str(exc))
+                return run
+            except Exception as exc:  # noqa: BLE001 - the run record must reflect any failure
+                logger.exception("pipeline crashed", extra={"profile_uuid": profile.uuid})
+                self._finalise_failure(profile, run, state, audit, f"unexpected error: {exc}")
+                return run
+
+            self._apply_audit(run, audit)
+            run.status = RUN_STATUS_PARTIAL if state.warnings else RUN_STATUS_COMPLETED
+            run.warnings = state.warnings
+            run.input_tokens = state.usage.input_tokens
+            run.output_tokens = state.usage.output_tokens
+            run.completed_at = utcnow()
+            profile.status = PROFILE_STATUS_READY
+            db.session.commit()
         finally:
             set_correlation_id(None)
-
-        run.status = RUN_STATUS_PARTIAL if state.warnings else RUN_STATUS_COMPLETED
-        run.warnings = state.warnings
-        run.input_tokens = state.usage.input_tokens
-        run.output_tokens = state.usage.output_tokens
-        run.completed_at = utcnow()
-        profile.status = PROFILE_STATUS_READY
-        db.session.commit()
+            clear_audit()
 
         logger.info(
             "pipeline finished",
@@ -182,6 +208,7 @@ class PipelineOrchestrator:
                 count=self.config["DISCOVERY_TARGET_QUERIES"],
             )
         except (AgentError, LLMError) as exc:
+            self._record_stage(STAGE_DISCOVERY, items_in=1, items_out=0, failures=1, error=str(exc))
             raise PipelineError(f"query discovery failed: {exc}") from exc
 
         state.usage.merge(result.usage)
@@ -189,6 +216,13 @@ class PipelineOrchestrator:
 
         drafts = result.data or []
         if not drafts:
+            self._record_stage(
+                STAGE_DISCOVERY,
+                items_in=1,
+                items_out=0,
+                failures=1,
+                error="query discovery returned no queries",
+            )
             raise PipelineError("query discovery returned no queries")
 
         # A profile can be run repeatedly; queries seen before are reused so their
@@ -217,6 +251,8 @@ class PipelineOrchestrator:
 
         run.queries_discovered = len(queries)
         db.session.commit()
+        # items_in is the one profile brief. items_out is what scoring will receive.
+        self._record_stage(STAGE_DISCOVERY, items_in=1, items_out=len(queries), failures=0)
         return queries
 
     def _fetch_metrics(
@@ -224,10 +260,34 @@ class PipelineOrchestrator:
     ) -> dict[str, KeywordMetrics]:
         """One batched call for the whole run rather than one per query."""
         try:
-            return self.seo_client.fetch_metrics([q.query_text for q in queries])
+            metrics = self.seo_client.fetch_metrics([q.query_text for q in queries])
         except DataForSEOError as exc:
             state.warn(f"keyword metrics unavailable, scoring without them: {exc}")
+            self._record_stage(
+                STAGE_METRICS,
+                items_in=len(queries),
+                items_out=0,
+                failures=1,
+                calls=1,
+                error=str(exc),
+            )
             return {}
+
+        # A row with no volume and no difficulty is not a handoff. The call still
+        # succeeded, so this is not a stage failure.
+        produced = sum(
+            1
+            for metric in metrics.values()
+            if metric.search_volume is not None or metric.difficulty is not None
+        )
+        self._record_stage(
+            STAGE_METRICS,
+            items_in=len(queries),
+            items_out=produced,
+            failures=0,
+            calls=1,
+        )
+        return metrics
 
     def _score_all(
         self,
@@ -238,6 +298,7 @@ class PipelineOrchestrator:
     ) -> None:
         metrics = self._fetch_metrics(queries, state)
         scored = 0
+        last_error: str | None = None
 
         for query in queries:
             try:
@@ -245,10 +306,19 @@ class PipelineOrchestrator:
                 scored += 1
             except (AgentError, LLMError) as exc:
                 # One bad query must not cost us the other fourteen.
-                query.scoring_error = str(exc)[:1000]
+                last_error = str(exc)
+                query.scoring_error = last_error[:1000]
                 query.visibility_status = VISIBILITY_UNKNOWN
                 state.warn(f"scoring failed for {query.query_text[:60]!r}: {exc}")
 
+        failed = len(queries) - scored
+        self._record_stage(
+            STAGE_SCORING,
+            items_in=len(queries),
+            items_out=scored,
+            failures=failed,
+            error=last_error if failed else None,
+        )
         run.queries_scored = scored
         db.session.commit()
 
@@ -262,14 +332,18 @@ class PipelineOrchestrator:
         metrics: dict[str, KeywordMetrics],
         state: _RunState,
     ) -> None:
-        result = self.scoring_agent.score(
-            query_text=query.query_text,
-            commercial_intent=query.commercial_intent,
-            target_domain=profile.domain,
-            target_name=profile.name,
-            competitors=profile.competitors or [],
-            metrics=metrics.get(query.query_text.strip().lower()),
-        )
+        token = set_audit_query(query.uuid)
+        try:
+            result = self.scoring_agent.score(
+                query_text=query.query_text,
+                commercial_intent=query.commercial_intent,
+                target_domain=profile.domain,
+                target_name=profile.name,
+                competitors=profile.competitors or [],
+                metrics=metrics.get(query.query_text.strip().lower()),
+            )
+        finally:
+            reset_audit_query(token)
         state.usage.merge(result.usage)
 
         visibility = result.data
@@ -297,6 +371,7 @@ class PipelineOrchestrator:
 
         if not gaps:
             state.warn("no visibility gaps found, skipping recommendations")
+            self._record_stage(STAGE_RECOMMENDATION, items_in=0, items_out=0, failures=0)
             return
 
         contexts = [
@@ -321,10 +396,25 @@ class PipelineOrchestrator:
         except (AgentError, LLMError) as exc:
             # Scored queries are already persisted and useful on their own.
             state.warn(f"recommendation generation failed: {exc}")
+            self._record_stage(
+                STAGE_RECOMMENDATION,
+                items_in=len(contexts),
+                items_out=0,
+                failures=1,
+                error=str(exc),
+            )
             return
 
         state.usage.merge(result.usage)
         state.warnings.extend(result.warnings)
+        produced = len(result.data or [])
+        self._record_stage(
+            STAGE_RECOMMENDATION,
+            items_in=len(contexts),
+            items_out=produced,
+            failures=0 if produced else 1,
+            error=None if produced else "no usable recommendations",
+        )
 
         # A rerun replaces the previous recommendations rather than stacking them.
         ContentRecommendation.query.filter_by(profile_uuid=profile.uuid).delete()
@@ -350,32 +440,157 @@ class PipelineOrchestrator:
     # --- single-query re-check ----------------------------------------------
 
     def recheck(self, query: DiscoveredQuery) -> DiscoveredQuery:
-        """Re-run Agent 2 for one query, e.g. after content has been published."""
+        """Re-run Agent 2 for one query, e.g. after content has been published.
+
+        Writes its own pipeline_runs row (kind=recheck) so the call, the cost and
+        any failure are queryable. Does not change the profile's lifecycle status.
+        """
         profile = query.profile
-        set_correlation_id(query.uuid)
+        run = PipelineRun(
+            profile_uuid=profile.uuid,
+            kind=RUN_KIND_RECHECK,
+            status=RUN_STATUS_RUNNING,
+            started_at=utcnow(),
+        )
+        db.session.add(run)
+        db.session.commit()
+
+        set_correlation_id(run.uuid)
         state = _RunState()
+        audit = start_audit()
 
         try:
-            metrics = self._fetch_metrics([query], state)
-            self._score_one(profile, query, metrics, state)
+            try:
+                metrics = self._fetch_metrics([query], state)
+                self._score_one(profile, query, metrics, state)
+            except (AgentError, LLMError) as exc:
+                self._record_stage(
+                    STAGE_SCORING, items_in=1, items_out=0, failures=1, error=str(exc)
+                )
+                self._finalise_recheck_failure(run, state, audit, str(exc))
+                raise PipelineError(f"recheck failed: {exc}") from exc
+
+            self._record_stage(STAGE_SCORING, items_in=1, items_out=1, failures=0)
+            self._apply_audit(run, audit)
+            run.status = RUN_STATUS_PARTIAL if state.warnings else RUN_STATUS_COMPLETED
+            run.warnings = state.warnings
+            run.queries_scored = 1
+            run.input_tokens = state.usage.input_tokens
+            run.output_tokens = state.usage.output_tokens
+            run.completed_at = utcnow()
             db.session.commit()
-        except (AgentError, LLMError) as exc:
-            db.session.rollback()
-            raise PipelineError(f"recheck failed: {exc}") from exc
         finally:
             set_correlation_id(None)
+            clear_audit()
 
         return query
+
+    # --- audit ---------------------------------------------------------------
+
+    def _record_stage(
+        self,
+        stage: str,
+        *,
+        items_in: int,
+        items_out: int,
+        failures: int,
+        error: str | None = None,
+        calls: int | None = None,
+    ) -> None:
+        audit = current_audit()
+        if audit is None:
+            return
+        message = (error or "").strip()
+        audit.stages.append(
+            StageRecord(
+                stage=stage,
+                sequence=STAGE_SEQUENCE[stage],
+                upstream_stage=STAGE_UPSTREAM[stage],
+                items_in=items_in,
+                items_out=items_out,
+                failures=failures,
+                last_error=message[:1000] or None,
+                calls=calls,
+            )
+        )
+
+    def _apply_audit(self, run: PipelineRun, audit: AuditBuffer) -> None:
+        """Copy the in-memory buffer onto the run. Does not commit."""
+        total_cost = 0.0
+        for call in audit.calls:
+            cost = estimate_llm_cost(
+                call.model, call.input_tokens, call.output_tokens, self.config
+            )
+            total_cost += cost
+            db.session.add(
+                LlmCallLog(
+                    run_uuid=run.uuid,
+                    profile_uuid=run.profile_uuid,
+                    query_uuid=call.query_uuid,
+                    agent=call.agent,
+                    model=call.model,
+                    attempt=call.attempt,
+                    is_retry=call.is_retry,
+                    status=call.status,
+                    input_tokens=call.input_tokens,
+                    output_tokens=call.output_tokens,
+                    latency_ms=call.latency_ms,
+                    estimated_cost_usd=cost,
+                    error_message=call.error_message,
+                )
+            )
+
+        for stage in audit.stages:
+            calls = audit.calls_for(stage.stage)
+            stage_cost = round(
+                sum(
+                    estimate_llm_cost(call.model, call.input_tokens, call.output_tokens, self.config)
+                    for call in calls
+                ),
+                6,
+            )
+            db.session.add(
+                PipelineStageStat(
+                    run_uuid=run.uuid,
+                    profile_uuid=run.profile_uuid,
+                    stage=stage.stage,
+                    sequence=stage.sequence,
+                    upstream_stage=stage.upstream_stage,
+                    items_in=stage.items_in,
+                    items_out=stage.items_out,
+                    calls=stage.calls if stage.calls is not None else len(calls),
+                    retries=sum(1 for call in calls if call.is_retry),
+                    failures=stage.failures,
+                    input_tokens=sum(call.input_tokens for call in calls),
+                    output_tokens=sum(call.output_tokens for call in calls),
+                    latency_ms=sum(call.latency_ms for call in calls),
+                    estimated_cost_usd=stage_cost,
+                    last_error=stage.last_error,
+                )
+            )
+
+        run.llm_calls = len(audit.calls)
+        run.llm_retries = sum(1 for call in audit.calls if call.is_retry)
+        run.llm_failures = sum(1 for call in audit.calls if call.status == LLM_STATUS_ERROR)
+        run.estimated_cost_usd = round(total_cost, 6)
 
     # --- failure handling ----------------------------------------------------
 
     def _finalise_failure(
-        self, profile: BusinessProfile, run: PipelineRun, state: _RunState, message: str
+        self,
+        profile: BusinessProfile,
+        run: PipelineRun,
+        state: _RunState,
+        audit: AuditBuffer,
+        message: str,
     ) -> None:
+        run_uuid = run.uuid
+        profile_uuid = profile.uuid
         db.session.rollback()
         # Re-attach after the rollback, then record the failure in its own transaction.
-        run = db.session.get(PipelineRun, run.uuid)
-        profile = db.session.get(BusinessProfile, profile.uuid)
+        # The audit buffer is in memory, so the rollback does not drop it.
+        run = db.session.get(PipelineRun, run_uuid)
+        profile = db.session.get(BusinessProfile, profile_uuid)
         if run is not None:
             run.status = RUN_STATUS_FAILED
             run.error_message = message[:2000]
@@ -383,10 +598,28 @@ class PipelineOrchestrator:
             run.input_tokens = state.usage.input_tokens
             run.output_tokens = state.usage.output_tokens
             run.completed_at = utcnow()
+            self._apply_audit(run, audit)
         if profile is not None:
             profile.status = PROFILE_STATUS_FAILED
         db.session.commit()
         logger.error("pipeline failed", extra={"reason": message})
+
+    def _finalise_recheck_failure(
+        self, run: PipelineRun, state: _RunState, audit: AuditBuffer, message: str
+    ) -> None:
+        run_uuid = run.uuid
+        db.session.rollback()
+        run = db.session.get(PipelineRun, run_uuid)
+        if run is None:
+            return
+        run.status = RUN_STATUS_FAILED
+        run.error_message = message[:2000]
+        run.warnings = state.warnings
+        run.input_tokens = state.usage.input_tokens
+        run.output_tokens = state.usage.output_tokens
+        run.completed_at = utcnow()
+        self._apply_audit(run, audit)
+        db.session.commit()
 
 
 __all__ = ["PipelineOrchestrator", "PipelineError", "build_agents", "build_dataforseo"]
