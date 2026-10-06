@@ -19,6 +19,36 @@ RUN_STATUS_COMPLETED = "completed"
 RUN_STATUS_PARTIAL = "completed_with_errors"
 RUN_STATUS_FAILED = "failed"
 
+# A full pipeline and a one-query recheck share pipeline_runs so both are queryable,
+# and `kind` keeps the two from being mixed in an aggregate.
+RUN_KIND_PIPELINE = "pipeline"
+RUN_KIND_RECHECK = "recheck"
+
+# Stages in execution order. Agent names match the agent classes so a call log and
+# a stage row join on the same string. DataForSEO is a stage, not an agent.
+STAGE_DISCOVERY = "query_discovery"
+STAGE_METRICS = "dataforseo"
+STAGE_SCORING = "visibility_scoring"
+STAGE_RECOMMENDATION = "content_recommendation"
+STAGE_SEQUENCE = {
+    STAGE_DISCOVERY: 1,
+    STAGE_METRICS: 2,
+    STAGE_SCORING: 3,
+    STAGE_RECOMMENDATION: 4,
+}
+STAGE_UPSTREAM = {
+    STAGE_DISCOVERY: None,
+    STAGE_METRICS: STAGE_DISCOVERY,
+    STAGE_SCORING: STAGE_METRICS,
+    STAGE_RECOMMENDATION: STAGE_SCORING,
+}
+
+# Outcome of one model call. "unparseable" is the corrective retry, not a failure:
+# the call returned, the body was not JSON, and the agent tried once more.
+LLM_STATUS_SUCCESS = "success"
+LLM_STATUS_UNPARSEABLE = "unparseable"
+LLM_STATUS_ERROR = "error"
+
 # Visibility
 VISIBILITY_VISIBLE = "visible"
 VISIBILITY_NOT_VISIBLE = "not_visible"

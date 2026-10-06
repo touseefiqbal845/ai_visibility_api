@@ -12,12 +12,15 @@ Volume and difficulty are not estimated at all. They come from DataForSEO.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from app.agents.base import AgentResult, BaseAgent, TokenUsage
 from app.clients.dataforseo import KeywordMetrics
-from app.constants import VISIBILITY_NOT_VISIBLE, VISIBILITY_VISIBLE
+from app.clients.llm import LLMError
+from app.constants import LLM_STATUS_ERROR, LLM_STATUS_SUCCESS, VISIBILITY_NOT_VISIBLE, VISIBILITY_VISIBLE
 from app.utils.brands import brand_variants, rank_mentions
+from app.utils.run_audit import record_llm_call
 from app.utils.scoring import ScoreBreakdown, compute_opportunity_score
 
 logger = logging.getLogger(__name__)
@@ -78,13 +81,33 @@ class VisibilityScoringAgent(BaseAgent):
         warnings: list[str] = []
 
         # LLMError propagates: the orchestrator records it against this one query and
-        # carries on with the rest of the batch.
-        response = self.llm.complete(
+        # carries on with the rest of the batch. The call itself is audited either way.
+        started = time.perf_counter()
+        try:
+            response = self.llm.complete(
+                model=self.model,
+                system=self.system_prompt,
+                user=query_text,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+        except LLMError as exc:
+            record_llm_call(
+                agent=self.name,
+                model=self.model,
+                attempt=1,
+                status=LLM_STATUS_ERROR,
+                started=started,
+                error=str(exc),
+            )
+            raise
+        record_llm_call(
+            agent=self.name,
             model=self.model,
-            system=self.system_prompt,
-            user=query_text,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
+            attempt=1,
+            status=LLM_STATUS_SUCCESS,
+            started=started,
+            response=response,
         )
         usage.add(response)
 

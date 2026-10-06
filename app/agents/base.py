@@ -8,11 +8,14 @@ and on failure give the model one corrective turn before giving up.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.clients.llm import AnthropicClient, LLMError, LLMResponse
+from app.constants import LLM_STATUS_ERROR, LLM_STATUS_SUCCESS, LLM_STATUS_UNPARSEABLE
 from app.utils.json_parse import MalformedLLMResponse, extract_json
+from app.utils.run_audit import record_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,7 @@ class BaseAgent:
         raw = ""
         for attempt in range(2):
             prompt = attempts[-1]["content"]
+            started = time.perf_counter()
             try:
                 response = self.llm.complete(
                     model=self.model,
@@ -92,15 +96,34 @@ class BaseAgent:
                     prefill=prefill,
                 )
             except LLMError as exc:
+                record_llm_call(
+                    agent=self.name,
+                    model=self.model,
+                    attempt=attempt + 1,
+                    status=LLM_STATUS_ERROR,
+                    started=started,
+                    error=str(exc),
+                )
                 raise AgentError(f"{self.name}: {exc}") from exc
 
             usage.add(response)
             raw = response.text
 
             try:
-                return extract_json(raw)
+                parsed = extract_json(raw)
             except MalformedLLMResponse:
-                if attempt == 1:
+                # The first bad body is a retry, not a failure. The second one is.
+                gave_up = attempt == 1
+                record_llm_call(
+                    agent=self.name,
+                    model=self.model,
+                    attempt=attempt + 1,
+                    status=LLM_STATUS_ERROR if gave_up else LLM_STATUS_UNPARSEABLE,
+                    started=started,
+                    response=response,
+                    error="response was not valid JSON",
+                )
+                if gave_up:
                     break
                 logger.warning(
                     "agent returned unparseable json, retrying",
@@ -120,6 +143,17 @@ class BaseAgent:
                         ),
                     }
                 )
+                continue
+
+            record_llm_call(
+                agent=self.name,
+                model=self.model,
+                attempt=attempt + 1,
+                status=LLM_STATUS_SUCCESS,
+                started=started,
+                response=response,
+            )
+            return parsed
 
         raise AgentError(f"{self.name}: model did not return parseable JSON")
 

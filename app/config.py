@@ -18,6 +18,13 @@ def _as_int(value: str | None, default: int) -> int:
         return default
 
 
+def _as_float(value: str | None, default: float) -> float:
+    try:
+        return float(value) if value is not None else default
+    except ValueError:
+        return default
+
+
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 
@@ -36,6 +43,16 @@ class Config:
     MODEL_RECOMMENDATION = os.getenv("MODEL_RECOMMENDATION", "claude-sonnet-5")
     LLM_TIMEOUT_SECONDS = _as_int(os.getenv("LLM_TIMEOUT_SECONDS"), 90)
     LLM_MAX_RETRIES = _as_int(os.getenv("LLM_MAX_RETRIES"), 1)
+    # List price in USD per million tokens, for analytics only. Cache reads, cache
+    # writes and batch discounts are not applied. A model missing from the table
+    # uses the fallback pair, so an unknown id still produces a number you can SUM.
+    LLM_MODEL_PRICING = {
+        "claude-sonnet-5": (2.0, 10.0),
+        "claude-haiku-4-5": (1.0, 5.0),
+        "claude-haiku-4-5-20251001": (1.0, 5.0),
+    }
+    LLM_PRICE_INPUT_PER_MILLION = _as_float(os.getenv("LLM_PRICE_INPUT_PER_MILLION"), 2.0)
+    LLM_PRICE_OUTPUT_PER_MILLION = _as_float(os.getenv("LLM_PRICE_OUTPUT_PER_MILLION"), 10.0)
 
     # --- DataForSEO ---
     DATAFORSEO_LOGIN = os.getenv("DATAFORSEO_LOGIN")
@@ -75,6 +92,9 @@ class TestingConfig(Config):
     DATAFORSEO_LOGIN = "test-login"
     DATAFORSEO_PASSWORD = "test-password"
     LLM_MAX_RETRIES = 1
+    # Flat rate so audit tests can assert the cost formula without a real model id.
+    LLM_PRICE_INPUT_PER_MILLION = 1.0
+    LLM_PRICE_OUTPUT_PER_MILLION = 2.0
 
 
 _CONFIGS = {
